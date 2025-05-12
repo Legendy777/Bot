@@ -32,7 +32,7 @@ export class BotService {
   private readonly channelId: string;
   private readonly channelUrl: string;
   private bannerIndex: { [key: string]: number } = {};
-  private slideshowIntervals: { [key: string]: NodeJS.Timeout } = {};
+  private slideshowIntervals: Map<string, { intervalId: NodeJS.Timeout; timeoutId: NodeJS.Timeout; chatId: number; messageId: number; language: string; callbackQueryId: string; lastInteractionTime: number; }> = new Map();
   private isPlaying: { [key: string]: boolean } = {};
   private userMessageIds: { [key: string]: number } = {};
 
@@ -53,21 +53,157 @@ export class BotService {
     this.initializeActions();
   }
 
+  private async stopSlideshow(userId: string, chatId?: number, messageId?: number, language?: string) {
+    // Проверяем наличие userId, так как это обязательный параметр
+    if (!userId) {
+      this.logger.error(`[SLIDESHOW_DEBUG] stopSlideshow called without userId`);
+      return false;
+    }
+    
+    this.logger.debug(`[SLIDESHOW_DEBUG] stopSlideshow called for user ${userId}. Optional chatId: ${chatId}, messageId: ${messageId}, language: ${language}`);
+    const slideshowData = this.slideshowIntervals.get(userId);
+
+    if (slideshowData) {
+        this.logger.debug(`[SLIDESHOW_DEBUG] Clearing interval (${slideshowData.intervalId}) and timeout (${slideshowData.timeoutId}) for user ${userId}`);
+        clearInterval(slideshowData.intervalId);
+        clearTimeout(slideshowData.timeoutId);
+        this.slideshowIntervals.delete(userId);
+    } else {
+        this.logger.debug(`[SLIDESHOW_DEBUG] No active slideshow data found in map for user ${userId}`);
+    }
+    
+    // Проверяем наличие userId в isPlaying
+    const wasPlaying = userId in this.isPlaying ? this.isPlaying[userId] : false;
+    this.isPlaying[userId] = false; 
+    this.logger.debug(`[SLIDESHOW_DEBUG] Set isPlaying to false for user ${userId}.`);
+
+    // Проверяем все необходимые параметры перед обновлением разметки
+    if (chatId && messageId && language && wasPlaying) {
+        this.logger.debug(`[SLIDESHOW_DEBUG] Attempting to update markup for user ${userId} in chat ${chatId}, message ${messageId} after auto-stop.`);
+        try {
+            const l = this.getLocalization(language);
+            // Проверяем наличие метода getMainMenuKeyboard
+            if (typeof this.getMainMenuKeyboard === 'function') {
+                const keyboard = this.getMainMenuKeyboard(language, userId);
+                
+                // Проверяем, была ли автоматическая остановка по таймеру
+                const isAutoStop = slideshowData && Date.now() - (slideshowData.lastInteractionTime || 0) > 30000;
+                
+                // Обновляем клавиатуру и добавляем сообщение об остановке в подпись, если это автоматическая остановка
+                if (isAutoStop) {
+                    // Получаем текущий баннер
+                    const currentBanner = BANNERS[language][this.bannerIndex[userId] || 0];
+                    const menuText = `${currentBanner.game}\n\n⏹️ ${l.slideshow?.stoppedTimer || 'Автопрокрутка остановлена по таймеру'}`;
+                    
+                    // Обновляем сообщение с новой подписью, включающей уведомление об остановке
+                    await this.bot.telegram.editMessageCaption(
+                        chatId, 
+                        messageId, 
+                        undefined, 
+                        menuText, 
+                        { reply_markup: keyboard, parse_mode: 'HTML' }
+                    );
+                    this.logger.debug(`[SLIDESHOW_DEBUG] Updated caption with auto-stop notification for user ${userId}`);
+                } else {
+                    // Просто обновляем клавиатуру
+                    await this.bot.telegram.editMessageReplyMarkup(chatId, messageId, undefined, keyboard);
+                    
+                    // Пытаемся отправить уведомление через callback query, если он не устарел
+                    if (slideshowData?.callbackQueryId) {
+                        try {
+                            await this.bot.telegram.answerCbQuery(slideshowData.callbackQueryId, l.slideshow?.stoppedManual || '⏹️ Автопрокрутка остановлена', { show_alert: false });
+                            this.logger.debug(`[SLIDESHOW_DEBUG] Successfully sent stop notification for user ${userId} with callbackQueryId ${slideshowData.callbackQueryId}`);
+                        } catch (cbError: any) {
+                            this.logger.warn(`[SLIDESHOW_DEBUG] Failed to answer callback query: ${cbError.message}`);
+                        }
+                    } else {
+                        this.logger.warn(`[SLIDESHOW_DEBUG] No callbackQueryId available for stop notification for user ${userId}`);
+                    }
+                }
+                
+                this.logger.debug(`[SLIDESHOW_DEBUG] Successfully updated markup for message ${messageId} after stop.`);
+            } else {
+                this.logger.warn(`[SLIDESHOW_DEBUG] getMainMenuKeyboard method not found`);
+            }
+        } catch (error: any) {
+            this.logger.warn(`[SLIDESHOW_DEBUG] Failed to update markup for message ${messageId} after stop: ${error.message}`);
+        }
+    } else if (wasPlaying) {
+        this.logger.debug(`[SLIDESHOW_DEBUG] Not updating markup due to missing parameters: chatId=${chatId}, messageId=${messageId}, language=${language}`);
+    }
+    return wasPlaying;
+  }
+
   private initializeActions() {
-    this.bot.action('cabinet', (ctx) => this.handleCabinet(ctx));
-    this.bot.action('banner_prev', (ctx) => this.handleBannerControl(ctx, 'prev'));
-    this.bot.action('banner_next', (ctx) => this.handleBannerControl(ctx, 'next'));
-    this.bot.action('banner_play', (ctx) => this.handleBannerControl(ctx, 'play'));
-    this.bot.action('banner_stop', (ctx) => this.handleBannerControl(ctx, 'stop'));
-    this.bot.action('check_subscription', (ctx) => this.handleCheckSubscription(ctx));
-    this.bot.action('lang_ru', (ctx) => this.handleLanguageChange(ctx, 'ru'));
-    this.bot.action('lang_en', (ctx) => this.handleLanguageChange(ctx, 'en'));
-    this.bot.action('share', (ctx) => this.handleShare(ctx));
-    this.bot.action('back_to_menu', (ctx) => this.handleBackToMenu(ctx));
-    this.bot.action('refresh_cabinet', (ctx) => this.handleRefreshCabinet(ctx));
-    this.bot.action('orders', (ctx) => this.handleOrders(ctx));
-    this.bot.action('deposit_usdt', (ctx) => this.handleBalance(ctx));
-    this.bot.action('withdraw', (ctx) => this.handleBalance(ctx));
+    this.bot.action('cabinet', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleCabinet(ctx);
+    });
+    this.bot.action('banner_prev', async (ctx) => {
+        if (!ctx.from) return;
+        await this.stopSlideshow(ctx.from.id.toString()); 
+        await this.handleBannerControl(ctx, 'prev');
+    });
+    this.bot.action('banner_next', async (ctx) => {
+        if (!ctx.from) return;
+        await this.stopSlideshow(ctx.from.id.toString());
+        await this.handleBannerControl(ctx, 'next');
+    });
+    this.bot.action('banner_play', async (ctx) => {
+        if (!ctx.from) return;
+        await this.handleBannerControl(ctx, 'play');
+    });
+     this.bot.action('banner_stop', async (ctx) => {
+        if (!ctx.from) return;
+        await this.stopSlideshow(ctx.from.id.toString()); 
+        await this.handleBannerControl(ctx, 'stop');
+    });
+    this.bot.action('check_subscription', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleCheckSubscription(ctx);
+    });
+    this.bot.action('lang_ru', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleLanguageChange(ctx, 'ru');
+    });
+    this.bot.action('lang_en', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleLanguageChange(ctx, 'en');
+    });
+    this.bot.action('share', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleShare(ctx);
+    });
+    this.bot.action('back_to_menu', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleBackToMenu(ctx);
+    });
+    this.bot.action('refresh_cabinet', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleRefreshCabinet(ctx);
+    });
+    this.bot.action('orders', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleOrders(ctx);
+    });
+    this.bot.action('deposit_usdt', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleBalance(ctx);
+    });
+    this.bot.action('withdraw', async (ctx) => {
+      if (!ctx.from) return;
+      await this.stopSlideshow(ctx.from.id.toString());
+      await this.handleBalance(ctx);
+    });
   }
 
   async sendMessage(ctx: any, text: string) {
@@ -157,11 +293,11 @@ export class BotService {
 
   async handleLanguageChange(ctx: Context, language: string) {
     if (!ctx.from || !ctx.callbackQuery) {
-        this.logger.warn('handleLanguageChange called without ctx.from or callbackQuery');
         if(ctx.from) await this.showLanguageSelection(ctx);
         return;
     }
-    const userId = ctx.from.id.toString();
+    const userId = ctx.from.id;
+
     const l = this.getLocalization(language);
     const messageId = this.getMessageIdToEdit(ctx);
 
@@ -172,18 +308,18 @@ export class BotService {
     }
 
     try {
-      await this.databaseService.updateUserLanguage(userId, language);
+      await this.databaseService.updateUserLanguage(userId.toString(), language);
       if (!this.channelId) {
         this.logger.error('CRITICAL: channelId is not set for subscription check!');
         await ctx.telegram.editMessageCaption(ctx.chat?.id, messageId, undefined, l.errors.general, { reply_markup: { inline_keyboard: [] } });
         return;
       }
 
-      const chatMember = await ctx.telegram.getChatMember(this.channelId, parseInt(userId));
+      const chatMember = await ctx.telegram.getChatMember(this.channelId, userId);
       const isSubscribed = ['member', 'administrator', 'creator'].includes(chatMember.status);
 
       if (isSubscribed) {
-        await this.databaseService.updateSubscriptionStatus(userId, true);
+        await this.databaseService.updateSubscriptionStatus(userId.toString(), true);
         await this.showMainMenu(ctx, true, messageId);
       } else {
         const keyboard = {
@@ -207,7 +343,6 @@ export class BotService {
             );
             this.logger.log(`Edited message ${messageId} for user ${userId} to show subscription request with GIF: ${SUBSCRIBE_REQUEST_GIF}`);
           } catch (error) {
-            this.logger.error(`Error editing message media (not subscribed) for ${userId}:`, error);
             if (this.userMessageIds[userId] === messageId) {
                  try { await ctx.deleteMessage(messageId); } catch(e){this.logger.warn("Could not delete old msg")}
             }
@@ -236,7 +371,6 @@ export class BotService {
         }
       }
     } catch (error) {
-      this.logger.error(`Error in handleLanguageChange for user ${userId}:`, error);
       try {
         await ctx.telegram.editMessageCaption(ctx.chat?.id, messageId, undefined, l.errors.general, { reply_markup: { inline_keyboard: [] } });
       } catch (editError) {
@@ -247,31 +381,33 @@ export class BotService {
 
   async handleCheckSubscription(ctx: Context) {
     if (!ctx.from || !ctx.callbackQuery) {
-        this.logger.warn('handleCheckSubscription called without ctx.from or callbackQuery');
         return;
     }
-    const userId = ctx.from.id.toString();
-    const user = await this.databaseService.getUserById(userId);
+    const userId = ctx.from.id;
+
+    const user = await this.databaseService.getUserById(userId.toString());
+    if (!user) {
+        await this.showLanguageSelection(ctx);
+        return;
+    }
     const l = this.getLocalization(user.language);
     const messageId = this.getMessageIdToEdit(ctx);
 
     if (!messageId) {
-        this.logger.warn(`No messageId found to edit in handleCheckSubscription for user ${userId}.`);
         await this.showLanguageSelection(ctx);
         return;
     }
 
     try {
       if (!this.channelId) {
-        this.logger.error('CRITICAL: channelId is not set for subscription check!');
         await ctx.answerCbQuery(l.errors.general, { show_alert: true });
         return;
       }
-      const chatMember = await ctx.telegram.getChatMember(this.channelId, parseInt(userId));
+      const chatMember = await ctx.telegram.getChatMember(this.channelId, userId);
       const isSubscribed = ['member', 'administrator', 'creator'].includes(chatMember.status);
 
       if (isSubscribed) {
-        await this.databaseService.updateSubscriptionStatus(userId, true);
+        await this.databaseService.updateSubscriptionStatus(userId.toString(), true);
         await ctx.answerCbQuery(l.subscriptionSuccess || '✅ Отлично! Подписка подтверждена!', { show_alert: true });
         
         let messageSuccessfullyDeleted = false;
@@ -279,7 +415,7 @@ export class BotService {
             try { 
                 await ctx.deleteMessage(this.userMessageIds[userId]);
                 this.logger.log(`Successfully deleted message ${this.userMessageIds[userId]} in handleCheckSubscription for user ${userId}`);
-                delete this.userMessageIds[userId]; // Clear the stored ID
+                delete this.userMessageIds[userId];
                 messageSuccessfullyDeleted = true;
             } catch(e) { 
                 this.logger.warn(`Could not delete subscription message ${this.userMessageIds[userId]} for user ${userId}:`, e);
@@ -287,17 +423,15 @@ export class BotService {
         }
 
         if (messageSuccessfullyDeleted) {
-            await this.showMainMenu(ctx, false); // Force sending a new message
+            await this.showMainMenu(ctx, false);
         } else {
-            // If deletion didn't happen or failed, try to edit the original prompt messageId
             await this.showMainMenu(ctx, true, messageId); 
         }
       } else {
         await ctx.answerCbQuery(l.subscriptionFailed || '❌ Подписка не найдена. Пожалуйста, подпишитесь.', { show_alert: true });
       }
     } catch (error) {
-      this.logger.error(`Error in handleCheckSubscription for user ${ctx.from?.id}:`, error);
-      const lang = ctx.from?.id ? (await this.databaseService.getUserById(ctx.from.id.toString()))?.language || 'ru' : 'ru';
+      const lang = user?.language || 'ru';
       const l = this.getLocalization(lang);
       await ctx.answerCbQuery(l.errors.general || 'Ошибка при проверке подписки.');
     }
@@ -346,59 +480,7 @@ export class BotService {
       this.logger.log(`Showing main menu for user ${userId}. Language: ${language}.`);
       this.logger.debug(`Current banner text: "${menuText}", animation URL: "${currentBanner.animation}"`);
 
-      const buttonTexts = language === 'ru'
-        ? {
-            catalog: '📂 Каталог',
-            news: '📱 Новости',
-            cabinet: '💼 Кабинет',
-            about: '❗ О нас',
-            support: '👨‍💼 Поддержка',
-            reviews: '✅ Отзывы',
-            share: '🚀 Поделиться',
-            language: '🇬🇧 English',
-            prev: '⏮',
-            next: '⏭',
-            playStop: this.isPlaying[userId] ? '⏹' : '▶️',
-          }
-        : {
-            catalog: '📂 Catalog',
-            news: '📱 News',
-            cabinet: '💼 Cabinet',
-            about: '❗ About',
-            support: '👨‍💼 Support',
-            reviews: '✅ Reviews',
-            share: '🚀 Share',
-            language: '🇷🇺 Русский',
-            prev: '⏮',
-            next: '⏭',
-            playStop: this.isPlaying[userId] ? '⏹' : '▶️',
-          };
-
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: buttonTexts.prev, callback_data: 'banner_prev' },
-            { text: buttonTexts.playStop, callback_data: this.isPlaying[userId] ? 'banner_stop' : 'banner_play' },
-            { text: buttonTexts.next, callback_data: 'banner_next' },
-          ],
-          [
-            { text: buttonTexts.catalog, callback_data: 'catalog' },
-            { text: buttonTexts.news, callback_data: 'news' },
-          ],
-          [
-            { text: buttonTexts.cabinet, callback_data: 'cabinet' },
-            { text: buttonTexts.about, callback_data: 'about' },
-          ],
-          [
-            { text: buttonTexts.support, callback_data: 'support' },
-            { text: buttonTexts.reviews, callback_data: 'reviews' },
-          ],
-          [
-            { text: buttonTexts.language, callback_data: language === 'ru' ? 'lang_en' : 'lang_ru' },
-            { text: buttonTexts.share, callback_data: 'share' },
-          ],
-        ],
-      };
+      const keyboard = this.getMainMenuKeyboard(language, userId);
 
       const messageId = messageIdToEdit ?? this.getMessageIdToEdit(ctx);
 
@@ -438,46 +520,202 @@ export class BotService {
   }
 
   async handleBannerControl(ctx: Context, action: 'prev' | 'next' | 'play' | 'stop') {
+    if (!ctx.from) return; 
+    const userId = ctx.from.id.toString();
+    const user = await this.databaseService.getUserById(userId);
+    const language = user ? user.language : 'ru';
+    const l = this.getLocalization(language);
+
+    const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat.id;
+    const messageId = this.getMessageIdToEdit(ctx);
+    const callbackQueryId = ctx.callbackQuery?.id;
+
+    this.logger.debug(`[SLIDESHOW_DEBUG] handleBannerControl: action='${action}', userId=${userId}, chatId=${chatId}, messageId=${messageId}, lang=${language}`);
+
     try {
-      if (!ctx.from) return;
-      const userId = ctx.from.id.toString();
-      const user = await this.databaseService.getUserById(userId);
-      const language = user ? user.language : 'ru';
+      if (!BANNERS[language] || BANNERS[language].length === 0) {
+          this.logger.error(`No banners found for language: ${language} in handleBannerControl`);
+          await ctx.answerCbQuery('Ошибка загрузки баннеров.', { show_alert: true });
+          return;
+      }
 
       switch (action) {
         case 'prev':
           this.bannerIndex[userId] = (this.bannerIndex[userId] - 1 + BANNERS[language].length) % BANNERS[language].length;
-          await ctx.answerCbQuery('⏮ Предыдущий баннер', { show_alert: false });
+          // Обновляем callbackQueryId и lastInteractionTime при взаимодействии с prev
+          if (callbackQueryId) {
+              const currentData = this.slideshowIntervals.get(userId);
+              if (currentData && this.isPlaying[userId]) {
+                  this.slideshowIntervals.set(userId, {
+                      ...currentData,
+                      callbackQueryId: callbackQueryId,
+                      lastInteractionTime: Date.now()
+                  });
+                  this.logger.debug(`[SLIDESHOW_DEBUG] Updated callbackQueryId to ${callbackQueryId} for prev action for user ${userId}`);
+              }
+          }
           break;
         case 'next':
           this.bannerIndex[userId] = (this.bannerIndex[userId] + 1) % BANNERS[language].length;
-          await ctx.answerCbQuery('⏭ Следующий баннер', { show_alert: false });
+          // Обновляем callbackQueryId и lastInteractionTime при взаимодействии с next
+          if (callbackQueryId) {
+              const currentData = this.slideshowIntervals.get(userId);
+              if (currentData && this.isPlaying[userId]) {
+                  this.slideshowIntervals.set(userId, {
+                      ...currentData,
+                      callbackQueryId: callbackQueryId,
+                      lastInteractionTime: Date.now()
+                  });
+                  this.logger.debug(`[SLIDESHOW_DEBUG] Updated callbackQueryId to ${callbackQueryId} for next action for user ${userId}`);
+              }
+          }
           break;
         case 'play':
-          this.isPlaying[userId] = true;
-          if (this.slideshowIntervals[userId]) {
-            clearInterval(this.slideshowIntervals[userId]);
+          if (!chatId || !messageId) { 
+             this.logger.error(`[SLIDESHOW_DEBUG] Cannot start slideshow for user ${userId}: Missing chatId or messageId.`);
+             await ctx.answerCbQuery(l.errors.general || 'Ошибка запуска автопрокрутки.', { show_alert: true });
+             break;
           }
-          this.slideshowIntervals[userId] = setInterval(() => {
-            this.bannerIndex[userId] = (this.bannerIndex[userId] + 1) % BANNERS[language].length;
-            this.showMainMenu(ctx, true);
-          }, 5000);
-          await ctx.answerCbQuery('▶️ Автопрокрутка включена', { show_alert: false });
+          if (!this.isPlaying[userId]) {
+              this.logger.debug(`[SLIDESHOW_DEBUG] Starting slideshow for user ${userId} in chat ${chatId}, message ${messageId}`);
+              await this.stopSlideshow(userId); 
+              this.isPlaying[userId] = true;
+
+              // Получаем callbackQueryId из контекста
+              let callbackQueryId = ctx.callbackQuery?.id || '';
+              if (callbackQueryId) {
+                  this.logger.debug(`[SLIDESHOW_DEBUG] Retrieved callbackQueryId ${callbackQueryId} from context for user ${userId}`);
+              } else {
+                  this.logger.warn(`[SLIDESHOW_DEBUG] No callbackQueryId available for user ${userId} when starting slideshow`);
+              }
+              
+              // Сохраняем текущее время взаимодействия
+              const lastInteractionTime = Date.now();
+              this.logger.debug(`[SLIDESHOW_DEBUG] Saved interaction time ${lastInteractionTime} for user ${userId}`);
+              
+
+              const intervalId = setInterval(async () => {
+                 const currentSlideshowData = this.slideshowIntervals.get(userId);
+                 if (!currentSlideshowData) {
+                     this.logger.warn(`[SLIDESHOW_DEBUG] Interval tick for user ${userId}, but no slideshow data found. Clearing interval.`);
+                     clearInterval(intervalId);
+                     return;
+                 }
+                 const currentChatId = currentSlideshowData.chatId;
+                 const currentMessageId = currentSlideshowData.messageId;
+                 const currentLanguage = currentSlideshowData.language;
+                 
+                 // Проверяем, не обновился ли callbackQueryId в другом месте
+                 if (ctx.callbackQuery?.id && ctx.callbackQuery.id !== currentSlideshowData.callbackQueryId) {
+                     // Обновляем callbackQueryId и время последнего взаимодействия
+                     const updatedData = {
+                         ...currentSlideshowData,
+                         callbackQueryId: ctx.callbackQuery.id,
+                         lastInteractionTime: Date.now()
+                     };
+                     this.slideshowIntervals.set(userId, updatedData);
+                     this.logger.debug(`[SLIDESHOW_DEBUG] Updated callbackQueryId to ${ctx.callbackQuery.id} during interval tick for user ${userId}`);
+                 }
+
+                 this.bannerIndex[userId] = (this.bannerIndex[userId] + 1) % BANNERS[currentLanguage].length;
+                 const nextBanner = BANNERS[currentLanguage][this.bannerIndex[userId]];
+                 const nextMenuText = `${nextBanner.game}`; 
+                 this.logger.debug(`[SLIDESHOW_DEBUG] Interval tick user ${userId}: New index ${this.bannerIndex[userId]}, next banner: ${nextMenuText}`);
+                 if (!nextBanner || !nextBanner.animation) {
+                     this.logger.error(`[SLIDESHOW_DEBUG] Interval tick user ${userId}: Invalid next banner data.`);
+                     return;
+                 }
+                 
+                 const keyboard = this.getMainMenuKeyboard(currentLanguage, userId); 
+                 try {
+                     await this.bot.telegram.editMessageMedia(
+                        currentChatId, currentMessageId, undefined, 
+                        { type: 'animation', media: nextBanner.animation, caption: nextMenuText, parse_mode: 'HTML' },
+                        { reply_markup: keyboard }
+                    );
+                     this.logger.debug(`[SLIDESHOW_DEBUG] Interval tick user ${userId}: Successfully updated message ${currentMessageId}`);
+                 } catch (error: any) {
+                     this.logger.warn(`[SLIDESHOW_DEBUG] Interval tick user ${userId}: Failed to edit message ${currentMessageId}: ${error.message}`);
+                 }
+              }, 5000); 
+
+              const timeoutId = setTimeout(async () => {
+                 this.logger.debug(`[SLIDESHOW_DEBUG] 33s Timeout Fired for user ${userId}. Calling stopSlideshow with context and language.`);
+                 const currentSlideshowData = this.slideshowIntervals.get(userId);
+                 if (currentSlideshowData) {
+                    // Проверяем наличие callbackQueryId перед остановкой
+                    if (!currentSlideshowData.callbackQueryId && callbackQueryId) {
+                        this.logger.debug(`[SLIDESHOW_DEBUG] Updating missing callbackQueryId ${callbackQueryId} for user ${userId} before auto-stop`);
+                        // Обновляем данные с актуальным callbackQueryId
+                        this.slideshowIntervals.set(userId, { ...currentSlideshowData, callbackQueryId });
+                    }
+                    
+                    // Устанавливаем флаг автоматической остановки
+                    const autoStopTime = Date.now();
+                    // Обновляем данные с флагом автоматической остановки
+                    this.slideshowIntervals.set(userId, { 
+                        ...currentSlideshowData, 
+                        lastInteractionTime: autoStopTime - 31000 // Гарантируем, что это будет считаться автоматической остановкой
+                    });
+                    
+                    await this.stopSlideshow(userId, currentSlideshowData.chatId, currentSlideshowData.messageId, currentSlideshowData.language); 
+                 }
+              }, 33000); 
+
+              // Сохраняем все данные, включая callbackQueryId и время последнего взаимодействия
+              this.slideshowIntervals.set(userId, { intervalId, timeoutId, chatId, messageId, language, callbackQueryId, lastInteractionTime });
+              
+              await ctx.answerCbQuery(l.slideshow?.started || '▶️ Автопрокрутка запущена (33 сек)', { show_alert: false });
+          } else {
+              this.logger.debug(`[SLIDESHOW_DEBUG] Slideshow already playing for user ${userId}. Ignoring play command.`);
+              await ctx.answerCbQuery(l.slideshow?.alreadyPlaying || '⚠️ Автопрокрутка уже активна', { show_alert: true }); 
+          }
           break;
         case 'stop':
-          this.isPlaying[userId] = false;
-          if (this.slideshowIntervals[userId]) {
-            clearInterval(this.slideshowIntervals[userId]);
-            delete this.slideshowIntervals[userId];
+          // Получаем данные слайд-шоу для пользователя
+          const slideshowData = this.slideshowIntervals.get(userId);
+          
+          // Если слайд-шоу активно, обновляем callbackQueryId и lastInteractionTime перед остановкой
+          if (this.isPlaying[userId] && slideshowData && callbackQueryId) {
+              // Обновляем данные с новым callbackQueryId и временем взаимодействия
+              this.slideshowIntervals.set(userId, {
+                  ...slideshowData,
+                  callbackQueryId: callbackQueryId,
+                  lastInteractionTime: Date.now()
+              });
+              this.logger.debug(`[SLIDESHOW_DEBUG] Updated callbackQueryId to ${callbackQueryId} before manual stop for user ${userId}`);
           }
-          await ctx.answerCbQuery('⏹ Автопрокрутка остановлена', { show_alert: false });
+          
+          // Останавливаем слайд-шоу
+          if (this.isPlaying[userId]) {
+              await this.stopSlideshow(userId, chatId, messageId, language);
+          }
+          
+          // Используем callbackQueryId из текущего контекста или из обновленных данных слайд-шоу
+          const cbQueryId = callbackQueryId || slideshowData?.callbackQueryId;
+          
+          if (!cbQueryId) {
+              this.logger.warn(`[SLIDESHOW_DEBUG] Cannot answer CbQuery for manual stop: Missing callbackQueryId for user ${userId}.`);
+          } else {
+              try {
+                  await ctx.answerCbQuery(l.slideshow?.stoppedManual || '⏹️ Автопрокрутка остановлена', { show_alert: false });
+                  this.logger.debug(`[SLIDESHOW_DEBUG] Successfully sent stop notification for user ${userId} with callbackQueryId ${cbQueryId}`);
+              } catch (cbError: any) {
+                  this.logger.warn(`[SLIDESHOW_DEBUG] Failed to answer callback query for stop action: ${cbError.message}`);
+              }
+          }
           break;
       }
+      
+      if (messageId) {
+        await this.showMainMenu(ctx, true, messageId); 
+      } else {
+         this.logger.warn(`[SLIDESHOW_DEBUG] handleBannerControl (action: ${action}): Cannot call showMainMenu, messageId is missing.`);
+      }
 
-      await this.showMainMenu(ctx, true);
     } catch (error) {
       this.logger.error('Error in handleBannerControl:', error);
-      await ctx.answerCbQuery('Произошла ошибка. Пожалуйста, попробуйте позже.');
+      await ctx.answerCbQuery('Произошла ошибка управления баннером.');
     }
   }
 
@@ -593,10 +831,13 @@ export class BotService {
   }
 
   async handleShare(ctx: Context) {
+    if (!ctx.from || !ctx.chat) {
+        return;
+    }
+    const userId = ctx.from.id;
+
     try {
-      if (!ctx.from || !ctx.chat) return;
-      const userId = ctx.from.id.toString();
-      const user = await this.databaseService.getUserById(userId);
+      const user = await this.databaseService.getUserById(userId.toString());
       const language = user?.language || 'ru';
       const l = this.getLocalization(language);
 
@@ -668,10 +909,13 @@ export class BotService {
   }
 
   async handleOrders(ctx: Context) {
+    if (!ctx.from) {
+        return;
+    }
+    const userId = ctx.from.id;
+
     try {
-      if (!ctx.from) return;
-      const userId = ctx.from.id.toString();
-      const orders = await this.databaseService.getOrders(userId);
+      const orders = await this.databaseService.getOrders(userId.toString());
 
       if (!orders || orders.length === 0) {
         return await ctx.reply('У вас пока нет заказов');
@@ -701,10 +945,13 @@ export class BotService {
   }
 
   async handleBalance(ctx: Context) {
+    if (!ctx.from) {
+        return;
+    }
+    const userId = ctx.from.id;
+
     try {
-      if (!ctx.from) return;
-      const userId = ctx.from.id.toString();
-      const user = await this.databaseService.getUserById(userId);
+      const user = await this.databaseService.getUserById(userId.toString());
       const l = this.getLocalization(user?.language || 'ru');
 
       if (!user) {
@@ -731,16 +978,16 @@ export class BotService {
   }
 
   async handleCabinet(ctx: Context) {
-    try {
-      if (!ctx.from) {
-        this.logger.error('User (ctx.from) is undefined in handleCabinet');
-        if ('callback_query' in ctx && ctx.callbackQuery) {
-          await ctx.answerCbQuery('Произошла ошибка: не удалось определить пользователя.', { show_alert: true });
-        }
-        return;
+    if (!ctx.from) {
+      if ('callback_query' in ctx && ctx.callbackQuery) {
+        await ctx.answerCbQuery('Произошла ошибка: не удалось определить пользователя.', { show_alert: true });
       }
-      const userId = ctx.from.id.toString();
-      const user = await this.databaseService.getUserById(userId);
+      return;
+    }
+    const userId = ctx.from.id;
+
+    try {
+      const user = await this.databaseService.getUserById(userId.toString());
       const l = this.getLocalization(user?.language || 'ru');
       this.logger.log(`Entering handleCabinet for user ${userId}. Language from DB: ${user?.language}, resolved localization to: ${user?.language || 'ru'}`);
 
@@ -751,14 +998,16 @@ export class BotService {
         return;
       }
 
-      const orders = await this.databaseService.getOrders(userId);
-      const orderCount = await this.databaseService.getOrderCount(userId);
-      const balanceUSDT = await this.databaseService.getBalance(userId, 'USDT');
-      const balanceRUB = await this.databaseService.getBalance(userId, 'RUB');
+      // Convert userId to string for database calls
+      const orders = await this.databaseService.getOrders(userId.toString());
+      const orderCount = await this.databaseService.getOrderCount(userId.toString());
+      const balanceUSDT = await this.databaseService.getBalance(userId.toString(), 'USDT');
+      const balanceRUB = await this.databaseService.getBalance(userId.toString(), 'RUB');
 
       let userPhoto;
       try {
-        const photos = await ctx.telegram.getUserProfilePhotos(parseInt(userId), 0, 1);
+        // Pass userId (number) directly to getUserProfilePhotos
+        const photos = await ctx.telegram.getUserProfilePhotos(userId, 0, 1);
         if (photos && photos.photos.length > 0) {
           userPhoto = photos.photos[0][0];
         }
@@ -774,7 +1023,7 @@ export class BotService {
         `${l.cabinet.partner}\n` +
         `${l.cabinet.percent} ${user.refPercent}%\n` +
         `${l.cabinet.referrals} ${user.referrals?.length || 0}\n` +
-        `${l.cabinet.balance} ${balanceUSDT} $\n` +
+        `${l.cabinet.balance} ${balanceUSDT} $\n` + // Assuming USDT balance is in $
         `${l.cabinet.link}\n`;
 
       const keyboard = {
@@ -787,8 +1036,23 @@ export class BotService {
         ],
       };
 
+      const messageIdToEdit = this.getMessageIdToEdit(ctx);
+      const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat.id;
+
+      if (!chatId || !messageIdToEdit) {
+          this.logger.error(`Cannot edit message in handleCabinet for user ${userId}: chatId or messageId missing.`);
+          if ('callback_query' in ctx) {
+            await ctx.answerCbQuery('Ошибка обновления кабинета.', { show_alert: true });
+          }
+          return;
+      }
+
       if (userPhoto) {
-        await ctx.editMessageMedia(
+        // Use editMessageMedia on telegram object to ensure it works with messageId
+        await ctx.telegram.editMessageMedia(
+          chatId,
+          messageIdToEdit,
+          undefined,
           {
             type: 'photo',
             media: userPhoto.file_id,
@@ -798,11 +1062,17 @@ export class BotService {
           { reply_markup: keyboard },
         );
       } else {
-        await ctx.editMessageText(message, {
+        // Use editMessageCaption on telegram object
+        await ctx.telegram.editMessageCaption(chatId, messageIdToEdit, undefined, message, {
           parse_mode: 'HTML' as const,
           reply_markup: keyboard,
         });
       }
+        // Answer callback query after successful edit
+        if ('callback_query' in ctx) {
+            await ctx.answerCbQuery();
+        }
+
     } catch (error) {
       this.logger.error('Error in handleCabinet:', error);
       if ('callback_query' in ctx) {
@@ -812,10 +1082,13 @@ export class BotService {
   }
 
   async handleBackToMenu(ctx: Context) {
+    if (!ctx.callbackQuery?.message || !ctx.from) {
+        return;
+    }
+    const userId = ctx.from.id;
+
     try {
-      if (!ctx.callbackQuery?.message || !ctx.from) return;
-      const userId = ctx.from.id.toString();
-      const user = await this.databaseService.getUserById(userId);
+      const user = await this.databaseService.getUserById(userId.toString());
       this.logger.log(`Entering handleBackToMenu for user ${userId}. Language from DB: ${user?.language}`);
 
       if (!user || !user.language) {
@@ -926,6 +1199,11 @@ export class BotService {
   }
 
   async handleRefreshCabinet(ctx: Context) {
+    if (!ctx.from) { 
+        return;
+    }
+     const userId = ctx.from.id;
+
     try {
       await this.handleCabinet(ctx);
       if ('callback_query' in ctx) {
@@ -947,5 +1225,49 @@ export class BotService {
 
   private getMessageIdToEdit(ctx: Context): number | undefined {
     return ctx.from ? this.userMessageIds[ctx.from.id.toString()] : undefined;
+  }
+
+  private getMainMenuKeyboard(language: string, userId: string) {
+     const buttonTexts = language === 'ru'
+        ? {
+            catalog: '📂 Каталог', news: '📱 Новости', cabinet: '💼 Кабинет',
+            about: '❗ О нас', support: '👨‍💼 Поддержка', reviews: '✅ Отзывы',
+            share: '🚀 Поделиться', language: '🇬🇧 English',
+            prev: '⏮', next: '⏭', 
+            playStop: this.isPlaying[userId] ? '⏹' : '▶️',
+          }
+        : {
+            catalog: '📂 Catalog', news: '📱 News', cabinet: '💼 Cabinet',
+            about: '❗ About', support: '👨‍💼 Support', reviews: '✅ Reviews',
+            share: '🚀 Share', language: '🇷🇺 Русский',
+            prev: '⏮', next: '⏭', 
+            playStop: this.isPlaying[userId] ? '⏹' : '▶️',
+          };
+          
+      return {
+        inline_keyboard: [
+          [
+            { text: buttonTexts.prev, callback_data: 'banner_prev' },
+            { text: buttonTexts.playStop, callback_data: this.isPlaying[userId] ? 'banner_stop' : 'banner_play' },
+            { text: buttonTexts.next, callback_data: 'banner_next' },
+          ],
+          [
+            { text: buttonTexts.catalog, callback_data: 'catalog' },
+            { text: buttonTexts.news, callback_data: 'news' },
+          ],
+          [
+            { text: buttonTexts.cabinet, callback_data: 'cabinet' },
+            { text: buttonTexts.about, callback_data: 'about' },
+          ],
+          [
+            { text: buttonTexts.support, callback_data: 'support' },
+            { text: buttonTexts.reviews, callback_data: 'reviews' },
+          ],
+          [
+            { text: buttonTexts.language, callback_data: language === 'ru' ? 'lang_en' : 'lang_ru' },
+            { text: buttonTexts.share, callback_data: 'share' },
+          ],
+        ],
+      };
   }
 }

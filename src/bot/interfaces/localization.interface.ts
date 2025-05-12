@@ -6,6 +6,13 @@ export interface Localization {
     profile: string;
     help: string;
   };
+  slideshow: {
+    started: string;
+    stoppedManual: string;
+    stoppedTimer: string;
+    alreadyPlaying: string;
+    callbackQueryId: string;
+  };
   errors: {
     general: string;
     notFound: string;
@@ -91,6 +98,13 @@ export const localizations: Record<string, Localization> = {
       profile: 'Профиль',
       help: 'Помощь',
     },
+    slideshow: {
+      started: 'Слайдшоу запущено',
+      stoppedManual: 'Слайдшоу остановлено',
+      stoppedTimer: 'Слайдшоу автоматически остановлено',
+      alreadyPlaying: 'Слайдшоу уже запущено',
+      callbackQueryId: 'Идентификатор запроса обратного вызова'
+    },
     errors: {
       general: 'Произошла ошибка. Пожалуйста, попробуйте позже.',
       notFound: 'Не найдено.',
@@ -169,6 +183,13 @@ export const localizations: Record<string, Localization> = {
   en: {
     welcome: 'Welcome!',
     menu: { main: 'Main Menu', settings: 'Settings', profile: 'Profile', help: 'Help' },
+    slideshow: {
+      started: 'Slideshow started',
+      stoppedManual: 'Slideshow stopped',
+      stoppedTimer: 'Slideshow automatically stopped',
+      alreadyPlaying: 'Slideshow is already playing',
+      callbackQueryId: 'Callback query ID'
+    },
     errors: { general: 'An error occurred. Please try again later.', notFound: 'Not found.', unauthorized: 'Unauthorized.', shareError: 'Error sharing.', cabinetError: 'Error loading cabinet.' },
     orders: { empty: 'You have no orders yet.', title: 'My Orders' },
     share: { title: 'Share Game', description: 'Join the game and get a bonus!', message: '📲 Share the bot with friends!', button: '🚀 Share' },
@@ -230,4 +251,4 @@ export const localizations: Record<string, Localization> = {
       selected: 'Selected category:',
     },
   },
-}; 
+};
